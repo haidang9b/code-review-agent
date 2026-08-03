@@ -1,0 +1,27 @@
+# Secrets
+.env
+
+# Vector store (rebuilds from knowledge/ and REPO_PATH)
+.chroma/
+
+# Generated review reports
+outputs/*
+!outputs/.gitkeep
+
+# Internal knowledge documents must never be committed.
+# Keep the folder structure and the seeded samples, ignore everything else.
+knowledge/**/*.pdf
+knowledge/**/*.docx
+knowledge/**/*.doc
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
