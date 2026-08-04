@@ -114,6 +114,18 @@ You must return structured output. For each finding:
   `secure-coding.pdf, page 4`. Use `null` for `general_best_practice` findings.
 - `recommendation` — a concrete, actionable change. Prefer the pattern the project already
   uses over a generic alternative.
+- `confidence` — how certain you are that this is a genuine issue, from `0.0` to `1.0`:
+  - **0.9–1.0** — certain. The code plainly does this and the rule plainly forbids it.
+  - **0.7–0.9** — confident. Minor ambiguity in how the rule applies here.
+  - **0.5–0.7** — plausible. Depends on context you cannot see, such as a caller you
+    were not shown or a convention that may exist elsewhere in the codebase.
+  - **below 0.5** — speculative. Only report at this level when the issue would be
+    severe if real; otherwise leave it out.
+
+  Report your real level of certainty. A correctly-labelled 0.6 is more useful than an
+  inflated 0.95, because the reader uses these numbers to decide what to check first.
+  Confidence is about *whether the issue is real*, not about how bad it is — severity
+  already carries that. A finding can be Critical and 0.5, or Low and 1.0.
 
 Every `evidence` value for a non-`general_best_practice` finding is checked against the
 retrieved context by a separate verification step. A finding whose quoted rule is not found

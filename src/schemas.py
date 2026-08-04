@@ -87,6 +87,18 @@ class ReviewFinding(BaseModel):
         description="Where the rule came from, e.g. 'coding-standards.md › Error Handling'.",
     )
     recommendation: str = Field(description="Concrete, actionable change to make.")
+    confidence: float = Field(
+        default=0.7,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "How certain you are that this is a genuine issue, from 0.0 to 1.0. "
+            "0.9+ = the code plainly does this and the rule plainly forbids it. "
+            "0.7-0.9 = confident with minor ambiguity. 0.5-0.7 = plausible but "
+            "depends on context you cannot see. Below 0.5 = speculative. Do not "
+            "inflate: an honest low number is more useful than a false high one."
+        ),
+    )
 
     @property
     def needs_grounding(self) -> bool:
@@ -153,6 +165,65 @@ class SkippedFile(BaseModel):
     reason: str
 
 
+class TokenUsage(BaseModel):
+    """Token accounting for one review run.
+
+    Collected from ``AIMessage.usage_metadata`` via LangChain's usage callback,
+    so the numbers are the provider's own, not an estimate.
+    """
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    # Reasoning-family deployments bill thinking tokens inside output_tokens;
+    # broken out here because it is often most of the cost.
+    reasoning_tokens: int = 0
+    cached_input_tokens: int = 0
+
+    review_calls: int = 0
+    verification_calls: int = 0
+    embedding_requests: int = 0
+
+    # Resolved model id → its own usage, e.g. {"gpt-5.1-2025-11-13": {...}}.
+    by_model: dict[str, dict] = Field(default_factory=dict)
+
+    @property
+    def model_calls(self) -> int:
+        return self.review_calls + self.verification_calls
+
+
+class ReviewScore(BaseModel):
+    """Two separate numbers, deliberately not merged into one.
+
+    ``score`` answers "how healthy is this change" — it is derived only from the
+    findings. ``confidence`` answers "how much should I trust this review" — it is
+    derived only from how much evidence was available. Averaging the two would
+    produce a number that means neither thing.
+
+    Both are computed deterministically from the report (see :mod:`src.scoring`);
+    neither is asked of the model, so the same findings always score the same.
+    """
+
+    score: int = Field(ge=0, le=100, description="Code health, 100 = no findings.")
+    verdict: str = Field(description="Plain-language reading of the score.")
+    penalty: float = Field(description="Total severity-weighted penalty subtracted from 100.")
+
+    confidence: float = Field(
+        ge=0.0, le=1.0, description="How much evidence this review rests on."
+    )
+    confidence_components: dict[str, float] = Field(
+        default_factory=dict,
+        description="The individual [0,1] signals averaged into `confidence`.",
+    )
+
+    findings_total: int = 0
+    findings_grounded: int = Field(
+        default=0, description="Findings backed by a verified project rule."
+    )
+    mean_finding_confidence: float = 0.0
+    severity_counts: dict[str, int] = Field(default_factory=dict)
+
+
 class ReviewReport(BaseModel):
     """The complete, aggregated result of reviewing a pull request."""
 
@@ -164,6 +235,20 @@ class ReviewReport(BaseModel):
     base_ref: str = ""
     head_ref: str = ""
     head_sha: str = ""
+
+    # ---- run metadata ----
+    # Which model produced this, what it cost, and how it scored. Recorded so a
+    # report read weeks later is still interpretable: findings from a small
+    # deployment do not carry the same weight as findings from a large one.
+    review_deployment: str = Field(
+        default="", description="Azure deployment name used for review + verification."
+    )
+    model_versions: list[str] = Field(
+        default_factory=list, description="Resolved model ids the provider reported."
+    )
+    usage: TokenUsage = Field(default_factory=TokenUsage)
+    score: Optional[ReviewScore] = None
+    duration_seconds: float = 0.0
 
     reviewed_files: list[str] = Field(default_factory=list)
     skipped_files: list[SkippedFile] = Field(default_factory=list)

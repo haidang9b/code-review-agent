@@ -18,9 +18,11 @@ Run directly for a demo:  ``python -m src.graph <pr-url>``
 from __future__ import annotations
 
 import re
+import time
 from pathlib import Path
 from typing import TypedDict
 
+from langchain_core.callbacks import get_usage_metadata_callback
 from langgraph.graph import END, START, StateGraph
 
 from .code_loader import IGNORED_DIRS, IGNORED_NAME_PARTS, language_for_path
@@ -39,8 +41,10 @@ from .schemas import (
     ReviewFinding,
     ReviewReport,
     SkippedFile,
+    TokenUsage,
     UnverifiedRule,
 )
+from .scoring import adjust_confidence, compute_score
 
 # A quoted rule this long that appears verbatim in the context needs no model
 # call to verify; below it, a coincidental match is too likely.
@@ -62,8 +66,44 @@ class CodeReviewState(TypedDict, total=False):
     findings: list[dict]
     positive_notes: list[dict]
     unverified_rules: list[dict]
+    usage: dict
+    started_at: float
     report: dict
     report_markdown: str
+
+
+# --- Token accounting ------------------------------------------------------
+
+
+def _merge_usage(base: dict | None, callback_usage: dict, **call_counts: int) -> dict:
+    """Fold one node's usage callback output into the running total.
+
+    The callback reports per-model totals; call counts are tracked separately
+    because a node's invocation count is not derivable from token sums.
+    """
+    usage = TokenUsage(**base) if base else TokenUsage()
+
+    for model, metadata in callback_usage.items():
+        usage.input_tokens += metadata.get("input_tokens", 0)
+        usage.output_tokens += metadata.get("output_tokens", 0)
+        usage.total_tokens += metadata.get("total_tokens", 0)
+        usage.reasoning_tokens += (metadata.get("output_token_details") or {}).get(
+            "reasoning", 0
+        )
+        usage.cached_input_tokens += (metadata.get("input_token_details") or {}).get(
+            "cache_read", 0
+        )
+
+        existing = usage.by_model.setdefault(
+            model, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+        )
+        for field in ("input_tokens", "output_tokens", "total_tokens"):
+            existing[field] += metadata.get(field, 0)
+
+    for name, count in call_counts.items():
+        setattr(usage, name, getattr(usage, name) + count)
+
+    return usage.model_dump()
 
 
 # --- Helpers ---------------------------------------------------------------
@@ -183,6 +223,7 @@ def fetch_pull_request(state: CodeReviewState) -> dict:
         )
 
     return {
+        "started_at": time.time(),
         "pr": {
             "url": ref.url,
             "number": ref.number,
@@ -223,7 +264,9 @@ def plan_review(state: CodeReviewState) -> dict:
 def retrieve_context(state: CodeReviewState) -> dict:
     """Retrieve tier-grouped context for every reviewable file."""
     contexts: dict[str, dict] = {}
-    for file in state.get("files", []):
+    files = state.get("files", [])
+
+    for file in files:
         retrieved = retrieve_for_file(
             path=file["path"],
             language=file.get("language", "text"),
@@ -233,9 +276,16 @@ def retrieve_context(state: CodeReviewState) -> dict:
             "block": retrieved.format(),
             "corpus": retrieved.grounding_corpus(),
             "sources": retrieved.sources(),
+            "doc_sources": retrieved.document_sources(),
             "empty": retrieved.is_empty,
         }
-    return {"contexts": contexts}
+
+    # One batched embedding request per file (see retrieve_for_file). Counted
+    # here so the usage report covers embeddings, not just chat completions.
+    return {
+        "contexts": contexts,
+        "usage": _merge_usage(state.get("usage"), {}, embedding_requests=len(files)),
+    }
 
 
 def review_files(state: CodeReviewState) -> dict:
@@ -253,46 +303,54 @@ def review_files(state: CodeReviewState) -> dict:
     positives: list[dict] = []
     unverified: list[dict] = []
     failures: list[dict] = []
+    calls = 0
 
-    for file in state.get("files", []):
-        path = file["path"]
-        context = contexts.get(path, {})
-        messages = build_review_messages(
-            repository=pr.get("repository", ""),
-            pr_number=pr.get("number", 0),
-            pr_title=pr.get("title", ""),
-            pr_description=pr.get("description", ""),
-            path=path,
-            status=file.get("status", "modified"),
-            language=file.get("language", "text"),
-            additions=file.get("additions", 0),
-            deletions=file.get("deletions", 0),
-            context_block=context.get("block", ""),
-            annotated_diff=file.get("annotated_diff", ""),
-            file_content=file.get("content"),
-        )
+    with get_usage_metadata_callback() as usage_callback:
+        for file in state.get("files", []):
+            path = file["path"]
+            context = contexts.get(path, {})
+            messages = build_review_messages(
+                repository=pr.get("repository", ""),
+                pr_number=pr.get("number", 0),
+                pr_title=pr.get("title", ""),
+                pr_description=pr.get("description", ""),
+                path=path,
+                status=file.get("status", "modified"),
+                language=file.get("language", "text"),
+                additions=file.get("additions", 0),
+                deletions=file.get("deletions", 0),
+                context_block=context.get("block", ""),
+                annotated_diff=file.get("annotated_diff", ""),
+                file_content=file.get("content"),
+            )
 
-        try:
-            review: FileReview = model.invoke(messages)
-        except Exception as exc:  # noqa: BLE001 - reported, never silently dropped
-            failures.append(_skip(path, f"review call failed: {type(exc).__name__}: {exc}"))
-            continue
+            try:
+                review: FileReview = model.invoke(messages)
+                calls += 1
+            except Exception as exc:  # noqa: BLE001 - reported, never silently dropped
+                failures.append(
+                    _skip(path, f"review call failed: {type(exc).__name__}: {exc}")
+                )
+                continue
 
-        for finding in review.findings:
-            finding.file = finding.file or path
-            findings.append(finding.model_dump())
-        for note in review.positive_notes:
-            note.file = note.file or path
-            positives.append(note.model_dump())
-        for rule in review.unverified_rules:
-            rule.file = rule.file or path
-            unverified.append(rule.model_dump())
+            for finding in review.findings:
+                finding.file = finding.file or path
+                findings.append(finding.model_dump())
+            for note in review.positive_notes:
+                note.file = note.file or path
+                positives.append(note.model_dump())
+            for rule in review.unverified_rules:
+                rule.file = rule.file or path
+                unverified.append(rule.model_dump())
+
+        collected = dict(usage_callback.usage_metadata)
 
     return {
         "findings": findings,
         "positive_notes": positives,
         "unverified_rules": unverified,
         "skipped_files": state.get("skipped_files", []) + failures,
+        "usage": _merge_usage(state.get("usage"), collected, review_calls=calls),
     }
 
 
@@ -314,57 +372,75 @@ def verify_findings(state: CodeReviewState) -> dict:
 
     kept: list[ReviewFinding] = []
     seen: set[tuple] = set()
+    calls = 0
 
-    for finding in raw_findings:
-        key = _finding_key(finding)
-        if key in seen:
-            continue
-        seen.add(key)
+    with get_usage_metadata_callback() as usage_callback:
+        for finding in raw_findings:
+            key = _finding_key(finding)
+            if key in seen:
+                continue
+            seen.add(key)
 
-        if not finding.needs_grounding:
-            kept.append(finding)
-            continue
+            corpus = contexts.get(finding.file, {}).get("corpus", "")
 
-        corpus = contexts.get(finding.file, {}).get("corpus", "")
-        claimed = finding.rule_source
-
-        if corpus and _quote_is_verbatim(finding.evidence, corpus):
-            kept.append(finding)
-            continue
-
-        supported = False
-        reason = "no project context was retrieved for this file"
-        if corpus:
-            try:
-                verdict: GroundingVerdict = verifier.invoke(
-                    build_verification_messages(finding, corpus)
+            if not finding.needs_grounding:
+                finding.confidence = adjust_confidence(
+                    finding.confidence, downgraded=False, had_context=bool(corpus)
                 )
-                supported, reason = verdict.supported, verdict.reason
-            except Exception as exc:  # noqa: BLE001 - fail closed, never fail loud
-                supported, reason = False, f"verification call failed: {type(exc).__name__}"
+                kept.append(finding)
+                continue
 
-        if supported:
-            kept.append(finding)
-            continue
+            claimed = finding.rule_source
 
-        finding.rule_source = "general_best_practice"
-        finding.rule_citation = None
-        kept.append(finding)
-        unverified.append(
-            UnverifiedRule(
-                concern=f"{finding.category}: {finding.description[:160]}",
-                reason=(
-                    f"Reported as a {claimed.replace('_', ' ')} but the rule could not be "
-                    f"verified in the retrieved context ({reason}). Reclassified as a "
-                    f"general best practice."
-                ),
-                file=finding.file,
+            if corpus and _quote_is_verbatim(finding.evidence, corpus):
+                kept.append(finding)
+                continue
+
+            supported = False
+            reason = "no project context was retrieved for this file"
+            if corpus:
+                try:
+                    verdict: GroundingVerdict = verifier.invoke(
+                        build_verification_messages(finding, corpus)
+                    )
+                    calls += 1
+                    supported, reason = verdict.supported, verdict.reason
+                except Exception as exc:  # noqa: BLE001 - fail closed, never fail loud
+                    supported, reason = (
+                        False,
+                        f"verification call failed: {type(exc).__name__}",
+                    )
+
+            if supported:
+                kept.append(finding)
+                continue
+
+            # The issue may still be real, so it survives — but its stated basis
+            # was wrong, and the confidence has to reflect that.
+            finding.rule_source = "general_best_practice"
+            finding.rule_citation = None
+            finding.confidence = adjust_confidence(
+                finding.confidence, downgraded=True, had_context=bool(corpus)
             )
-        )
+            kept.append(finding)
+            unverified.append(
+                UnverifiedRule(
+                    concern=f"{finding.category}: {finding.description[:160]}",
+                    reason=(
+                        f"Reported as a {claimed.replace('_', ' ')} but the rule could not be "
+                        f"verified in the retrieved context ({reason}). Reclassified as a "
+                        f"general best practice."
+                    ),
+                    file=finding.file,
+                )
+            )
+
+        collected = dict(usage_callback.usage_metadata)
 
     return {
         "findings": [f.model_dump() for f in kept],
         "unverified_rules": [u.model_dump() for u in unverified],
+        "usage": _merge_usage(state.get("usage"), collected, verification_calls=calls),
     }
 
 
@@ -374,13 +450,24 @@ def assemble_report(state: CodeReviewState) -> dict:
     contexts = state.get("contexts", {})
 
     sources: list[str] = []
+    doc_sources: set[str] = set()
     for context in contexts.values():
         for source in context.get("sources", []):
             if source not in sources:
                 sources.append(source)
+        doc_sources.update(context.get("doc_sources", []))
 
     findings = [ReviewFinding(**f) for f in state.get("findings", [])]
-    findings.sort(key=lambda f: (SEVERITY_ORDER[f.severity], f.file, f.line or 0))
+    # Highest severity first, then most-confident within a severity — the order a
+    # reader should work through them in.
+    findings.sort(
+        key=lambda f: (SEVERITY_ORDER[f.severity], -f.confidence, f.file, f.line or 0)
+    )
+
+    skipped = [SkippedFile(**s) for s in state.get("skipped_files", [])]
+    reviewed = [f["path"] for f in state.get("files", [])]
+    usage = TokenUsage(**state["usage"]) if state.get("usage") else TokenUsage()
+    started_at = state.get("started_at")
 
     report = ReviewReport(
         pr_url=pr.get("url", state.get("pr_url", "")),
@@ -391,8 +478,13 @@ def assemble_report(state: CodeReviewState) -> dict:
         base_ref=pr.get("base_ref", ""),
         head_ref=pr.get("head_ref", ""),
         head_sha=pr.get("head_sha", ""),
-        reviewed_files=[f["path"] for f in state.get("files", [])],
-        skipped_files=[SkippedFile(**s) for s in state.get("skipped_files", [])],
+        review_deployment=get_settings().review_deployment,
+        model_versions=sorted(usage.by_model),
+        usage=usage,
+        score=compute_score(findings, reviewed, skipped, len(doc_sources)),
+        duration_seconds=round(time.time() - started_at, 1) if started_at else 0.0,
+        reviewed_files=reviewed,
+        skipped_files=skipped,
         findings=findings,
         positive_notes=[PositiveNote(**p) for p in state.get("positive_notes", [])],
         unverified_rules=[UnverifiedRule(**u) for u in state.get("unverified_rules", [])],

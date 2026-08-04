@@ -139,12 +139,23 @@ def _summarize(report) -> str:
     lines = [
         f"{report.repository} PR #{report.pr_number} — {len(report.reviewed_files)} file(s) reviewed",
     ]
+
+    if report.score:
+        score = report.score
+        lines.append(
+            f"  score: {score.score}/100 ({score.verdict})"
+            f"   confidence: {score.confidence:.0%}"
+        )
+
     if report.findings:
         counts = ", ".join(f"{n} {level}" for level, n in report.severity_counts().items())
         lines.append(f"  findings: {len(report.findings)} ({counts})")
         for finding in report.findings[:10]:
             location = f"{finding.file}:{finding.line}" if finding.line else finding.file
-            lines.append(f"    [{finding.severity}/{finding.category}] {location} — {finding.description[:110]}")
+            lines.append(
+                f"    [{finding.severity}/{finding.category}] {finding.confidence:.0%} "
+                f"{location} — {finding.description[:100]}"
+            )
         if len(report.findings) > 10:
             lines.append(f"    … and {len(report.findings) - 10} more (see the report)")
     else:
@@ -157,6 +168,17 @@ def _summarize(report) -> str:
     if report.skipped_files:
         lines.append(f"  skipped / partial: {len(report.skipped_files)}")
     lines.append(f"  context sources cited: {len(report.context_sources)}")
+
+    usage = report.usage
+    model = report.review_deployment or "unknown"
+    if report.model_versions:
+        model += f" ({', '.join(report.model_versions)})"
+    lines.append(f"  model: {model}")
+    lines.append(
+        f"  tokens: {usage.total_tokens:,} total "
+        f"({usage.input_tokens:,} in / {usage.output_tokens:,} out)"
+        f" over {usage.model_calls} call(s) in {report.duration_seconds:g}s"
+    )
     return "\n".join(lines)
 
 

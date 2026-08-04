@@ -44,8 +44,8 @@ knowledge/**  (.md .pdf .docx)      REPO_PATH (local checkout)     GitHub API
 | `plan_review` | Deterministic (no model call): detects language, extracts changed symbols, and renders the diff with real new-file line numbers. |
 | `retrieve_context` | Per file, retrieves each priority tier separately with its own budget. One batched embedding request per file. |
 | `review_files` | One `with_structured_output(FileReview)` call per file, with tier-labelled context. |
-| `verify_findings` | The groundedness gate. Verbatim quotes pass for free; anything else is checked by a strict verifier. Unsupported project-rule claims are downgraded, not deleted. |
-| `assemble_report` | Sorts by severity and renders Markdown + JSON, including unverified concerns, skipped files, and every source consulted. |
+| `verify_findings` | The groundedness gate. Verbatim quotes pass for free; anything else is checked by a strict verifier. Unsupported project-rule claims are downgraded, not deleted, and their confidence is reduced accordingly. |
+| `assemble_report` | Sorts by severity then confidence, computes the code-health and confidence scores, and renders Markdown + JSON — including unverified concerns, skipped files, every source consulted, and the model and token cost of the run. |
 
 **Modern patterns used**
 
@@ -272,16 +272,25 @@ ever posted back to GitHub** — the token is only ever used to read.
 
 ```
 psf/requests PR #7589 — 5 file(s) reviewed
-  findings: 3 (1 High, 1 Medium, 1 Low)
-    [High/Bug] src/requests/utils.py:932 — `resolve_proxies` now calls `getproxies()` …
-    [Medium/Bug] src/requests/_internal_utils.py:46 — `unicode_is_ascii` now relies on …
-    [Low/Maintainability] src/requests/models.py:900 — The literal `32768` is a magic value …
+  score: 78/100 (Some issues to address)   confidence: 65%
+  findings: 5 (1 High, 2 Medium, 1 Low, 1 Info)
+    [High/Bug] 90% src/requests/utils.py:932 — The change from `get_environ_proxies(…)` …
+    [Medium/Bug] 80% src/requests/_internal_utils.py:46 — `unicode_is_ascii` now relies on …
+    [Medium/Performance] 78% src/requests/models.py:900 — Character set detection now operates …
+    [Low/Performance] 80% src/requests/cookies.py:596 — `names_from_jar` is now built as a set …
+    [Info/Performance] 70% src/requests/sessions.py:70 — The change simplifies `preferred_clock` …
   unverified concerns: 5
   skipped / partial: 4
-  context sources cited: 32
+  context sources cited: 33
+  model: gpt-5.1 (gpt-5.1-2025-11-13)
+  tokens: 50,129 total (47,698 in / 2,431 out) over 6 call(s) in 28.4s
 Report written to D:\…\outputs\pr-7589-review.md
 Report written to D:\…\outputs\pr-7589-review.json
 ```
+
+The percentage before each location is that finding's own confidence. See
+[Scores, confidence, and cost](#scores-confidence-and-cost) for how the two
+headline numbers are derived.
 
 **Exit codes**
 
@@ -355,6 +364,102 @@ python -m src.graph https://github.com/myorg/repo/pull/123   # prints the raw JS
 - **Files skipped or only partially reviewed** — deleted, binary, generated and
   over-limit files, and files whose context was excerpted rather than sent whole.
 - **Context consulted** — every source that could have been cited.
+- **Review run** — which model produced the report, how many tokens it cost, how
+  long it took, and how both scores were arrived at.
+
+---
+
+## Scores, confidence, and cost
+
+Every report carries two numbers. They are kept separate on purpose: averaging
+"how healthy is this code" with "how much should I trust this review" produces a
+figure that means neither thing.
+
+| | Question it answers | Range |
+|---|---|---|
+| **Code health** | How healthy is this change? | 0–100 |
+| **Review confidence** | How much evidence does this review rest on? | 0–100% |
+
+Both are computed **deterministically** from the findings in
+[src/scoring.py](src/scoring.py) — neither is asked of the model. A model-generated
+"quality score out of 100" would be exactly the kind of unverifiable claim the
+rest of this project exists to prevent: it would drift between runs and could not
+be audited. The same findings always produce the same score, and every input is
+printed in the report.
+
+### Code health
+
+Starts at 100 and subtracts, per finding, its severity weight **multiplied by its
+own confidence** — so a speculative Low barely registers while a certain Critical
+is expensive.
+
+| Severity | Weight at full confidence |
+|---|---|
+| Critical | 30 |
+| High | 14 |
+| Medium | 5 |
+| Low | 1.5 |
+| Info | 0 |
+
+| Score | Verdict |
+|---|---|
+| 100 | Clean — no findings |
+| 90–99 | Minor issues only |
+| 75–89 | Some issues to address |
+| 55–74 | Significant issues |
+| 30–54 | Serious issues |
+| 0–29 | Blocking issues |
+
+### Review confidence
+
+The mean of whichever evidence signals are available. Each is reported
+individually, so a low number always says *why*:
+
+| Signal | Meaning |
+|---|---|
+| `file_coverage` | Share of changed files reviewed with full context. A file whose context had to be excerpted counts as half; files excluded for being deleted, binary or generated are not counted against you, since skipping them is correct. |
+| `documentation_available` | Whether any project document was retrievable at all. `0%` means nothing could have been cited. |
+| `evidence_grounding` | Share of findings backed by a verified project rule. Omitted when there are no findings. |
+| `finding_confidence` | Mean confidence of the findings themselves. Omitted when there are no findings. |
+
+A confidence of 40% is not a broken review — it is the system telling you it had
+little to work with. The usual cause is an unindexed or thin `knowledge/` folder.
+
+### Per-finding confidence
+
+Each finding carries its own `confidence` (0–1), rendered as e.g.
+*"90% (certain)"*. The model reports a calibrated prior against a rubric in
+[prompts/reviewer.md](prompts/reviewer.md) — confidence is about *whether the
+issue is real*, not how bad it is, so a finding can be Critical at 50% or Low at
+100%. The pipeline then adjusts it with evidence the model could not weigh itself:
+
+- a finding whose claimed project rule **failed verification** is multiplied by
+  **0.6** — it may still be a real issue, but the reviewer was wrong about *why*;
+- a finding made with **no retrieved context** is multiplied by **0.8**.
+
+### Token usage and model
+
+Taken from the provider's own `usage_metadata` via LangChain's usage callback, so
+these are billed figures rather than an estimate:
+
+```
+- **Model:** `gpt-5.1 → gpt-5.1-2025-11-13`
+- **Model calls:** 6 (5 review, 1 verification), 5 embedding request(s)
+- **Tokens:** 50,129 total (47,698 in / 2,431 out, 10,240 cached)
+- **Duration:** 28.4s
+```
+
+Both the **deployment name** you configured and the **resolved model id** the
+provider reported are recorded, because a report read weeks later needs to say
+which model produced it — findings from a nano deployment do not carry the same
+weight as findings from a large one.
+
+Cost scales with **one review call per changed file**, plus one verification call
+per finding that claims a project rule without quoting it verbatim. Input tokens
+dominate: the retrieved context and file excerpts are large, the findings are
+small. Reasoning and cached-input tokens are broken out when the provider reports
+them. Every figure is in the JSON report under `usage`, `score` and
+`model_versions` for dashboards or trend tracking.
 
 ---
 
@@ -372,6 +477,7 @@ src/
 ├── github_client.py  read-only GitHub REST client
 ├── diff.py           patch parsing, real line numbers, hunk-window excerpts
 ├── schemas.py        Pydantic structured-output models
+├── scoring.py        deterministic code-health score and review confidence
 ├── prompts.py        loads prompts/reviewer.md, assembles messages
 ├── graph.py          the StateGraph pipeline
 ├── report.py         Markdown + JSON rendering

@@ -159,6 +159,19 @@ class RetrievedContext:
             seen.setdefault(citation_for(document), None)
         return list(seen)
 
+    def document_sources(self) -> list[str]:
+        """Citations from tiers 1–2 only, i.e. actual project documentation.
+
+        Distinct from :meth:`sources` because a review that retrieved plenty of
+        source code but no standards has nothing to cite as a *rule*, and the
+        confidence score needs to know the difference.
+        """
+        seen: dict[str, None] = {}
+        for tier in (TIER_CODING_STANDARD, TIER_ARCHITECTURE):
+            for document in self.by_tier.get(tier, []):
+                seen.setdefault(citation_for(document), None)
+        return list(seen)
+
 
 def _search_tier(tier: int, vectors: list[list[float]], limit: int) -> list[Document]:
     """Retrieve up to ``limit`` distinct chunks for one tier.

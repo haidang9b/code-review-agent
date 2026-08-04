@@ -43,6 +43,30 @@ def _fence(content: str) -> str:
     return "`" * max(3, longest + 1)
 
 
+def _confidence_note(confidence: float) -> str:
+    """Say what a review-level confidence figure actually means for the reader."""
+    if confidence >= 0.85:
+        return "well-evidenced"
+    if confidence >= 0.6:
+        return "reasonably evidenced"
+    if confidence >= 0.35:
+        return "thin evidence — verify before acting"
+    return "little evidence — treat as a first pass only"
+
+
+def _confidence_label(confidence: float) -> str:
+    """Render confidence as a percentage plus a word, so it reads at a glance."""
+    if confidence >= 0.9:
+        word = "certain"
+    elif confidence >= 0.7:
+        word = "confident"
+    elif confidence >= 0.5:
+        word = "plausible"
+    else:
+        word = "speculative"
+    return f"{confidence:.0%} ({word})"
+
+
 def _render_finding(index: int, finding: ReviewFinding) -> list[str]:
     icon = SEVERITY_ICONS.get(finding.severity, "")
     # Trailing double spaces are Markdown hard line breaks — without them the
@@ -51,6 +75,7 @@ def _render_finding(index: int, finding: ReviewFinding) -> list[str]:
         f"### {index}. {icon} {finding.severity} — {finding.category}",
         "",
         f"**Location:** `{_location(finding)}`  ",
+        f"**Confidence:** {_confidence_label(finding.confidence)}  ",
         f"**Basis:** {RULE_SOURCE_LABELS[finding.rule_source]}  ",
     ]
     if finding.rule_citation:
@@ -91,6 +116,16 @@ def render_markdown(report: ReviewReport) -> str:
         "## Summary",
         "",
     ]
+
+    if report.score:
+        score = report.score
+        lines += [
+            "| Code health | Review confidence |",
+            "|---|---|",
+            f"| **{score.score}/100** — {score.verdict} | "
+            f"**{score.confidence:.0%}** — {_confidence_note(score.confidence)} |",
+            "",
+        ]
 
     if report.has_findings:
         counts = ", ".join(f"{n} {level}" for level, n in report.severity_counts().items())
@@ -158,7 +193,76 @@ def render_markdown(report: ReviewReport) -> str:
         ]
     lines.append("")
 
+    lines += _render_run_metadata(report)
+
     return "\n".join(lines)
+
+
+def _render_run_metadata(report: ReviewReport) -> list[str]:
+    """Model, cost and score breakdown — what produced this report."""
+    usage = report.usage
+    lines = ["## Review run", ""]
+
+    model_line = report.review_deployment or "(unknown deployment)"
+    if report.model_versions:
+        model_line += f" → {', '.join(report.model_versions)}"
+    lines += [
+        f"- **Model:** `{model_line}`",
+        f"- **Model calls:** {usage.model_calls} "
+        f"({usage.review_calls} review, {usage.verification_calls} verification)"
+        + (f", {usage.embedding_requests} embedding request(s)" if usage.embedding_requests else ""),
+    ]
+
+    if usage.total_tokens:
+        token_line = (
+            f"- **Tokens:** {usage.total_tokens:,} total "
+            f"({usage.input_tokens:,} in / {usage.output_tokens:,} out"
+        )
+        if usage.reasoning_tokens:
+            token_line += f", {usage.reasoning_tokens:,} reasoning"
+        if usage.cached_input_tokens:
+            token_line += f", {usage.cached_input_tokens:,} cached"
+        lines.append(token_line + ")")
+    else:
+        lines.append("- **Tokens:** not reported by the provider")
+
+    if report.duration_seconds:
+        lines.append(f"- **Duration:** {report.duration_seconds:g}s")
+
+    if report.score:
+        score = report.score
+        lines += [
+            "",
+            f"**Code health {score.score}/100** — 100 minus a severity-weighted penalty "
+            f"of {score.penalty:g}, where each finding costs its severity weight "
+            f"multiplied by its own confidence.",
+            "",
+            f"**Review confidence {score.confidence:.0%}** — the mean of the evidence "
+            f"signals below. It says how much this review can be trusted, not how good "
+            f"the code is.",
+            "",
+            "| Signal | Value | Meaning |",
+            "|---|---|---|",
+        ]
+        explanations = {
+            "file_coverage": "share of the changed files reviewed with full context",
+            "documentation_available": "whether any project document was retrievable at all",
+            "evidence_grounding": "share of findings backed by a verified project rule",
+            "finding_confidence": "mean confidence of the findings themselves",
+        }
+        for name, value in score.confidence_components.items():
+            label = name.replace("_", " ")
+            lines.append(f"| {label} | {value:.0%} | {explanations.get(name, '')} |")
+
+        if score.findings_total:
+            lines += [
+                "",
+                f"{score.findings_grounded} of {score.findings_total} finding(s) cite a "
+                f"verified project rule; mean finding confidence "
+                f"{score.mean_finding_confidence:.0%}.",
+            ]
+    lines.append("")
+    return lines
 
 
 def render_json(report: ReviewReport) -> str:
